@@ -7,6 +7,140 @@
     </a>
 </div>
 
+# PHP Source Inspector
+
+> **This is a modified PHP binary.**  
+> For the upstream PHP interpreter, see [php/php-src](https://github.com/php/php-src).
+
+This fork adds a source/bytecode inspector that dumps the PHP source — or
+decoded opcode listing — of **every file the interpreter executes** to stderr.
+It is designed for reverse-engineering PHP applications, particularly those
+protected by commercial loaders (IonCube, Zend Guard, SourceGuardian, etc.)
+or OPcache file-cache-only deployments where no `.php` source files are present.
+
+[![Build Release](https://github.com/GarethWright/php-src/actions/workflows/release.yml/badge.svg)](https://github.com/GarethWright/php-src/actions/workflows/release.yml)
+
+## How it works
+
+Three hook points together cover every code path:
+
+| Hook | What it catches |
+|------|----------------|
+| `zend_compile_file` | Normal `require`/`include`/autoload without OPcache |
+| `zend_accel_load_script` (OPcache internals) | **Every** OPcache path: SHM cache hits, file-cache hits (`file_cache_only=1`), newly compiled scripts, preloaded scripts |
+| `zend_compile_string` | `eval()`, `assert(string)`, runtime-decrypted payloads |
+
+For each compiled unit the inspector decides what to output:
+
+```
+Source file readable on disk?
+  YES → /* ===[ PHP SOURCE: filename ]=== */
+        <verbatim source>
+        /* ===[ END SOURCE: filename ]=== */
+
+  NO  → /* ===[ BYTECODE: filename ]=== */
+        <opcode listing>
+        /* ===[ END BYTECODE: filename ]=== */
+        /* ===[ DECOMPILED: filename ]=== */
+        <best-effort PHP reconstruction>
+        /* ===[ END DECOMPILED: filename ]=== */
+
+eval() always outputs:
+        /* ===[ EVAL SOURCE: filename(line) : eval()'d code ]=== */
+        <the string passed to eval — the runtime-decrypted payload>
+        /* ===[ END EVAL SOURCE: ... ]=== */
+        + bytecode and decompiled as above
+```
+
+Each filename is output **at most once per process**, so cache hits,
+repeated includes, and the dual-hook OPcache path produce no duplicate output.
+
+## Download
+
+Prebuilt binaries for Linux x86_64 and Windows x64 are attached to every
+[release](https://github.com/GarethWright/php-src/releases).
+
+## Usage
+
+Drop the binary in place of your normal `php` CLI. All inspector output goes
+to **stderr**; normal PHP stdout is unaffected.
+
+### Inspect a file on disk
+
+```bash
+# Source is printed, then the script runs normally
+./php /path/to/script.php 2>source.txt
+```
+
+### Inspect a file-cache-only (no source) deployment
+
+```bash
+# Point OPcache at the .bin cache directory; source files need not exist
+PHP_INI_SCAN_DIR= ./php \
+  -d opcache.enable_cli=1 \
+  -d opcache.file_cache=/path/to/bin-cache \
+  -d opcache.file_cache_only=1 \
+  /path/to/entry.php 2>decoded.txt
+```
+
+The inspector will dump the decoded op_array for every cached script.
+
+### Intercept an IonCube / Zend Guard / SourceGuardian protected app
+
+```bash
+# The loader extension decrypts before returning the op_array;
+# our hook sees the plaintext opcodes.
+./php -d extension=/path/to/ioncube_loader.so app.php 2>decoded.txt
+```
+
+### Catch eval-based obfuscators
+
+```bash
+# Anything eval()'d — including multi-layer nested evals — is captured.
+./php obfuscated.php 2>decoded.txt
+grep -A 50 "EVAL SOURCE" decoded.txt
+```
+
+### Separate inspector output from application output
+
+```bash
+./php app.php 2>inspector.txt 1>app_output.txt
+```
+
+## Building from source
+
+### Linux
+
+```bash
+sudo apt-get install -y build-essential autoconf bison re2c \
+  libxml2-dev libsqlite3-dev
+
+./buildconf --force
+./configure --disable-all --enable-cli --enable-opcache --with-phar
+make -j$(nproc)
+# binary is at sapi/cli/php
+```
+
+### Windows
+
+See [Build your own PHP on Windows](https://wiki.php.net/internals/windows/stepbystepbuild_sdk_2).
+Use the same configure flags as above with `nmake` instead of `make`.
+
+## Coverage and limitations
+
+| Scenario | Covered |
+|----------|---------|
+| Normal `.php` files | Yes — source verbatim |
+| OPcache shared-memory cache hits | Yes — via `zend_accel_load_script` patch |
+| OPcache file cache (`file_cache_only=1`) | Yes — via `zend_accel_load_script` patch |
+| Preloaded scripts (`opcache.preload`) | Yes — patch fires at preload time |
+| Commercial loaders (IonCube, Zend Guard, etc.) | Yes — hook sees decrypted op_array |
+| `eval()` payloads (all nesting levels) | Yes — `zend_compile_string` hook |
+| Phar archives | Yes — source not on disk → bytecode dump |
+| Native-code-only execution (no Zend VM) | No — no op_array exists |
+
+---
+
 # The PHP Interpreter
 
 PHP is a popular general-purpose scripting language that is especially suited to
