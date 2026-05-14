@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#ifndef _WIN32
+# include <unistd.h>   /* dup, dup2, STDERR_FILENO */
+#endif
 
 #include "php.h"
 #include "zend.h"
@@ -43,6 +46,76 @@ ZEND_API zend_op_array *(*zend_source_inspector_orig_compile)(
 ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
 	zend_string *source_string, const char *filename,
 	zend_compile_position position) = NULL;
+
+/* =========================================================================
+ * php.ini: inspector.output_dir
+ * =========================================================================
+ * When set to a directory path, inspector output is written to per-script
+ * files in that directory instead of stderr.  PHP then runs as a fully
+ * transparent drop-in replacement — no extra output on stdout or stderr.
+ *
+ * File naming: the PHP filename is sanitized (path separators and special
+ * chars replaced with underscores) and suffixed with .inspector.
+ * Example: /var/www/app/index.php → {dir}/var_www_app_index.php.inspector
+ * ========================================================================= */
+
+#define INSPECTOR_MODULE_NUMBER  (-42)   /* unique negative — never clashes */
+
+static char *inspector_output_dir_cfg = NULL;
+
+static ZEND_INI_MH(inspector_on_output_dir_update)
+{
+	free(inspector_output_dir_cfg);
+	inspector_output_dir_cfg =
+		(new_value && ZSTR_LEN(new_value) > 0)
+			? strdup(ZSTR_VAL(new_value)) : NULL;
+	return SUCCESS;
+}
+
+/* ZEND_INI_BEGIN/END create: static const zend_ini_entry_def ini_entries[] */
+ZEND_INI_BEGIN()
+	ZEND_INI_ENTRY("inspector.output_dir", "", ZEND_INI_ALL,
+		inspector_on_output_dir_update)
+ZEND_INI_END()
+
+/*
+ * Open the output FILE* for one PHP script.  The caller must pass the result
+ * to inspector_close_output() when done.  Returns stderr if no dir is set.
+ */
+static FILE *inspector_open_output(const char *php_filename)
+{
+	const char *dir = inspector_output_dir_cfg;
+	if (!dir || !*dir) return stderr;
+
+	/* Sanitize: keep alnum / dot / hyphen, collapse everything else to '_' */
+	char safe[512];
+	size_t si = 0;
+	const char *p = php_filename;
+	while (*p == '/') p++;          /* skip leading slashes */
+	for (; *p && si < sizeof(safe) - 1; p++) {
+		char c = *p;
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		    (c >= '0' && c <= '9') || c == '.' || c == '-') {
+			safe[si++] = c;
+		} else {
+			if (si == 0 || safe[si - 1] != '_') safe[si++] = '_';
+		}
+	}
+	while (si > 0 && safe[si - 1] == '_') si--;  /* trim trailing '_' */
+	safe[si] = '\0';
+
+	char path[1536];
+	snprintf(path, sizeof(path), "%s/%s.inspector", dir, safe[0] ? safe : "unknown");
+
+	FILE *fp = fopen(path, "w");
+	return fp ? fp : stderr;
+}
+
+static void inspector_close_output(FILE *fp)
+{
+	if (fp && fp != stderr) fclose(fp);
+}
+
 
 /*
  * Deduplication table — tracks filenames already output this process.
@@ -75,34 +148,59 @@ static bool inspector_mark_seen(const char *filename)
  * ========================================================================= */
 
 static void inspector_output_source(
-	const char *filename, const char *src, size_t len)
+	FILE *out, const char *filename, const char *src, size_t len)
 {
-	fprintf(stderr, "\n/* ===[ PHP SOURCE: %s ]=== */\n", filename);
-	fwrite(src, 1, len, stderr);
-	if (len == 0 || src[len - 1] != '\n') {
-		fputc('\n', stderr);
-	}
-	fprintf(stderr, "/* ===[ END SOURCE: %s ]=== */\n\n", filename);
-	fflush(stderr);
+	fprintf(out, "\n/* ===[ PHP SOURCE: %s ]=== */\n", filename);
+	fwrite(src, 1, len, out);
+	if (len == 0 || src[len - 1] != '\n') fputc('\n', out);
+	fprintf(out, "/* ===[ END SOURCE: %s ]=== */\n\n", filename);
+	fflush(out);
 }
 
 /* =========================================================================
  * Bytecode output  (delegates to the existing zend_dump infrastructure)
  * ========================================================================= */
 
-static void inspector_output_bytecode(const zend_op_array *op_array)
+static void inspector_output_bytecode(FILE *out, const zend_op_array *op_array)
 {
 	const char *filename =
 		op_array->filename ? ZSTR_VAL(op_array->filename) : "(unknown)";
 
-	fprintf(stderr, "\n/* ===[ BYTECODE: %s ]=== */\n", filename);
-	fflush(stderr);
+	fprintf(out, "\n/* ===[ BYTECODE: %s ]=== */\n", filename);
+	fflush(out);
 
-	/* zend_dump_op_array writes to stderr directly */
-	zend_dump_op_array(op_array, ZEND_DUMP_LINE_NUMBERS, NULL, NULL);
+	/*
+	 * zend_dump_op_array always writes to stderr.  When our output target
+	 * is a file we temporarily point file-descriptor 2 at that file so the
+	 * dump lands there, then restore stderr afterwards.
+	 */
+	if (out == stderr) {
+		zend_dump_op_array(op_array, ZEND_DUMP_LINE_NUMBERS, NULL, NULL);
+	} else {
+#ifdef _WIN32
+		int saved_fd = _dup(_fileno(stderr));
+		fflush(stderr); fflush(out);
+		_dup2(_fileno(out), _fileno(stderr));
+		zend_dump_op_array(op_array, ZEND_DUMP_LINE_NUMBERS, NULL, NULL);
+		fflush(stderr);
+		_dup2(saved_fd, _fileno(stderr)); _close(saved_fd);
+#else
+		int saved_fd = dup(STDERR_FILENO);
+		if (saved_fd >= 0) {
+			fflush(stderr); fflush(out);
+			dup2(fileno(out), STDERR_FILENO);
+			zend_dump_op_array(op_array, ZEND_DUMP_LINE_NUMBERS, NULL, NULL);
+			fflush(stderr);
+			dup2(saved_fd, STDERR_FILENO);
+			close(saved_fd);
+		} else {
+			zend_dump_op_array(op_array, ZEND_DUMP_LINE_NUMBERS, NULL, NULL);
+		}
+#endif
+	}
 
-	fprintf(stderr, "/* ===[ END BYTECODE: %s ]=== */\n", filename);
-	fflush(stderr);
+	fprintf(out, "/* ===[ END BYTECODE: %s ]=== */\n", filename);
+	fflush(out);
 }
 
 /* =========================================================================
@@ -1380,32 +1478,27 @@ next:
 	} /* for each op */
 }
 
-/* Public entry: decompile op_array to stderr */
-static void inspector_decompile(const zend_op_array *op_array)
+static void inspector_decompile(FILE *out, const zend_op_array *op_array)
 {
 	const char *filename =
 		op_array->filename ? ZSTR_VAL(op_array->filename) : "(unknown)";
 
-	fprintf(stderr, "\n/* ===[ DECOMPILED: %s ]=== */\n", filename);
-	fprintf(stderr, "<?php\n");
-	fflush(stderr);
+	fprintf(out, "\n/* ===[ DECOMPILED: %s ]=== */\n<?php\n", filename);
+	fflush(out);
 
 	dc_state dc;
 	memset(&dc, 0, sizeof(dc));
-	dc.out   = stderr;
+	dc.out      = out;
 	dc.op_array = op_array;
 
 	dc_build_jump_map(&dc);
 	dc_run(&dc);
 
-	/* Free expression table */
-	for (int j = 0; j < DC_MAX_VARS; j++) {
-		free(dc.temps[j].str);
-	}
+	for (int j = 0; j < DC_MAX_VARS; j++) free(dc.temps[j].str);
 	free(dc.is_jump_target);
 
-	fprintf(stderr, "/* ===[ END DECOMPILED: %s ]=== */\n\n", filename);
-	fflush(stderr);
+	fprintf(out, "/* ===[ END DECOMPILED: %s ]=== */\n\n", filename);
+	fflush(out);
 }
 
 /* =========================================================================
@@ -1436,37 +1529,39 @@ ZEND_API void zend_source_inspector_inspect_op_array(zend_op_array *op_array)
 	const char *filename =
 		op_array->filename ? ZSTR_VAL(op_array->filename) : "(unknown)";
 
-	/* Emit each file at most once per process, regardless of how many
-	 * times OPcache loads it (cache hits, preloads, etc.). */
+	/* Emit each file at most once per process */
 	if (!inspector_mark_seen(filename)) return;
 
+	FILE *out = inspector_open_output(filename);
+
 	/* Try to read source from the filesystem */
-	FILE *fp = fopen(filename, "rb");
-	if (fp) {
-		fseek(fp, 0, SEEK_END);
-		long fsize = ftell(fp);
-		rewind(fp);
+	FILE *src_fp = fopen(filename, "rb");
+	if (src_fp) {
+		fseek(src_fp, 0, SEEK_END);
+		long fsize = ftell(src_fp);
+		rewind(src_fp);
 		if (fsize > 0) {
 			char *src = (char *)malloc((size_t)fsize + 1);
 			if (src) {
-				size_t nread = fread(src, 1, (size_t)fsize, fp);
+				size_t nread = fread(src, 1, (size_t)fsize, src_fp);
 				src[nread] = '\0';
-				fclose(fp);
-				inspector_output_source(filename, src, nread);
+				fclose(src_fp);
+				inspector_output_source(out, filename, src, nread);
 				free(src);
+				inspector_close_output(out);
 				return;
 			}
 		}
-		fclose(fp);
+		fclose(src_fp);
 	}
 
 	/*
-	 * Source not accessible: the .php file is absent (file-cache-only /
-	 * OPcache-only deployment, Phar, stream wrapper, embedded binary).
-	 * Dump the decoded opcode stream and attempt decompilation.
+	 * Source not accessible: file-cache-only deployment, Phar, stream
+	 * wrapper, or deleted file.  Dump decoded opcodes + decompile.
 	 */
-	inspector_output_bytecode(op_array);
-	inspector_decompile(op_array);
+	inspector_output_bytecode(out, op_array);
+	inspector_decompile(out, op_array);
+	inspector_close_output(out);
 }
 
 /* =========================================================================
@@ -1515,26 +1610,24 @@ static zend_op_array *source_inspector_compile_string(
 
 	/*
 	 * For eval'd strings the source is right here in `source_string`.
-	 * Output it as source (we always have it), then also dump bytecode so
-	 * the reader can see what the obfuscator's runtime payload looks like.
+	 * Output it, then dump bytecode so we see what the obfuscator's
+	 * runtime payload compiled to.
 	 */
 	const char *display_name = filename ? filename : "(eval)";
+	FILE *out = inspector_open_output(display_name);
 
-	fprintf(stderr, "\n/* ===[ EVAL SOURCE: %s ]=== */\n", display_name);
+	fprintf(out, "\n/* ===[ EVAL SOURCE: %s ]=== */\n", display_name);
 	if (ZSTR_LEN(source_string) > 0) {
-		fwrite(ZSTR_VAL(source_string), 1, ZSTR_LEN(source_string), stderr);
-		if (ZSTR_VAL(source_string)[ZSTR_LEN(source_string) - 1] != '\n') {
-			fputc('\n', stderr);
-		}
+		fwrite(ZSTR_VAL(source_string), 1, ZSTR_LEN(source_string), out);
+		if (ZSTR_VAL(source_string)[ZSTR_LEN(source_string) - 1] != '\n')
+			fputc('\n', out);
 	}
-	fprintf(stderr, "/* ===[ END EVAL SOURCE: %s ]=== */\n", display_name);
+	fprintf(out, "/* ===[ END EVAL SOURCE: %s ]=== */\n", display_name);
 
-	/* Always dump bytecode for eval — lets us see the compiled form even
-	 * when the source is garbled by an obfuscator's runtime decryptor. */
-	inspector_output_bytecode(op_array);
-	inspector_decompile(op_array);
+	inspector_output_bytecode(out, op_array);
+	inspector_decompile(out, op_array);
 
-	fflush(stderr);
+	inspector_close_output(out);
 	return op_array;
 }
 
@@ -1542,8 +1635,24 @@ static zend_op_array *source_inspector_compile_string(
  * Hook installation / removal
  * ========================================================================= */
 
+ZEND_API void zend_source_inspector_register_ini(void)
+{
+	/* zend_register_ini_entries() looks up the module in module_registry,
+	 * but INSPECTOR_MODULE_NUMBER (-42) is not a real module entry.
+	 * Call the _ex variant directly to bypass that lookup and register
+	 * straight into registered_zend_ini_directives (the persistent table)
+	 * so that php_init_config() / -d processing can find our key. */
+	zend_register_ini_entries_ex(ini_entries, INSPECTOR_MODULE_NUMBER, MODULE_PERSISTENT);
+}
+
 ZEND_API void zend_source_inspector_install(void)
 {
+	/* zend_register_ini_entries() requires the module in module_registry.
+	 * Use _ex() directly; by the time install() is called (after
+	 * zend_startup_extensions()), php_init_config() has already populated
+	 * configuration_hash, so our on_modify handler fires for -d/php.ini values. */
+	zend_register_ini_entries_ex(ini_entries, INSPECTOR_MODULE_NUMBER, MODULE_PERSISTENT);
+
 	if (zend_compile_file != source_inspector_compile_file) {
 		zend_source_inspector_orig_compile = zend_compile_file;
 		zend_compile_file = source_inspector_compile_file;
@@ -1556,6 +1665,10 @@ ZEND_API void zend_source_inspector_install(void)
 
 ZEND_API void zend_source_inspector_uninstall(void)
 {
+	zend_unregister_ini_entries_ex(INSPECTOR_MODULE_NUMBER, MODULE_PERSISTENT);
+	free(inspector_output_dir_cfg);
+	inspector_output_dir_cfg = NULL;
+
 	if (zend_compile_file == source_inspector_compile_file &&
 	    zend_source_inspector_orig_compile != NULL) {
 		zend_compile_file = zend_source_inspector_orig_compile;

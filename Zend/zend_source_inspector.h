@@ -38,6 +38,13 @@ extern ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
 ZEND_API void zend_source_inspector_inspect_op_array(zend_op_array *op_array);
 
 /*
+ * Register the inspector.output_dir php.ini entry.
+ * Must be called BEFORE php_init_config() so that -d and php.ini settings
+ * are captured.  Call immediately after zend_startup().
+ */
+ZEND_API void zend_source_inspector_register_ini(void);
+
+/*
  * Install the source/bytecode inspector hooks (compile_file + compile_string).
  * Call after all Zend extensions have been started (i.e. after
  * zend_startup_extensions()) so that OPcache's persistent_compile_file
