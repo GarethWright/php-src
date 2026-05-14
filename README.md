@@ -13,10 +13,13 @@
 > For the upstream PHP interpreter, see [php/php-src](https://github.com/php/php-src).
 
 This fork adds a source/bytecode inspector that dumps the PHP source — or
-decoded opcode listing — of **every file the interpreter executes** to stderr.
-It is designed for reverse-engineering PHP applications, particularly those
-protected by commercial loaders (IonCube, Zend Guard, SourceGuardian, etc.)
-or OPcache file-cache-only deployments where no `.php` source files are present.
+decoded opcode listing — of **every file the interpreter executes**.
+Output goes to per-script files in a configurable directory
+(`inspector.output_dir`), making the binary a transparent drop-in, or to
+stderr when no directory is set. It is designed for reverse-engineering PHP
+applications, particularly those protected by commercial loaders (IonCube,
+Zend Guard, SourceGuardian, etc.) or OPcache file-cache-only deployments
+where no `.php` source files are present.
 
 [![Build Release](https://github.com/GarethWright/php-src/actions/workflows/release.yml/badge.svg)](https://github.com/GarethWright/php-src/actions/workflows/release.yml)
 
@@ -60,12 +63,39 @@ repeated includes, and the dual-hook OPcache path produce no duplicate output.
 Prebuilt binaries for Linux x86_64 and Windows x64 are attached to every
 [release](https://github.com/GarethWright/php-src/releases).
 
+## Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `inspector.output_dir` | _(unset)_ | Directory to write per-script `.inspector` files. When set, stderr is silent and PHP runs as a transparent drop-in. |
+
+Set via `-d` flag or `php.ini`:
+
+```ini
+; php.ini
+inspector.output_dir = /var/log/php-inspector
+```
+
+```bash
+# per-invocation
+./php -d inspector.output_dir=/tmp/out script.php
+```
+
+Each intercepted script produces one file named after the sanitised script
+path, e.g. `/tmp/out/var_www_app_index.php.inspector`. The normal PHP stdout
+stream is untouched.
+
 ## Usage
 
-Drop the binary in place of your normal `php` CLI. All inspector output goes
-to **stderr**; normal PHP stdout is unaffected.
+### Drop-in mode (output dir set — no stderr noise)
 
-### Inspect a file on disk
+```bash
+mkdir /tmp/inspector_out
+./php -d inspector.output_dir=/tmp/inspector_out /path/to/app/entry.php
+ls /tmp/inspector_out/   # one .inspector file per loaded script
+```
+
+### Inspect a file on disk (stderr mode)
 
 ```bash
 # Source is printed, then the script runs normally
@@ -80,7 +110,8 @@ PHP_INI_SCAN_DIR= ./php \
   -d opcache.enable_cli=1 \
   -d opcache.file_cache=/path/to/bin-cache \
   -d opcache.file_cache_only=1 \
-  /path/to/entry.php 2>decoded.txt
+  -d inspector.output_dir=/tmp/decoded \
+  /path/to/entry.php
 ```
 
 The inspector will dump the decoded op_array for every cached script.
@@ -90,18 +121,21 @@ The inspector will dump the decoded op_array for every cached script.
 ```bash
 # The loader extension decrypts before returning the op_array;
 # our hook sees the plaintext opcodes.
-./php -d extension=/path/to/ioncube_loader.so app.php 2>decoded.txt
+./php \
+  -d extension=/path/to/ioncube_loader.so \
+  -d inspector.output_dir=/tmp/decoded \
+  app.php
 ```
 
 ### Catch eval-based obfuscators
 
 ```bash
 # Anything eval()'d — including multi-layer nested evals — is captured.
-./php obfuscated.php 2>decoded.txt
-grep -A 50 "EVAL SOURCE" decoded.txt
+./php -d inspector.output_dir=/tmp/decoded obfuscated.php
+grep -rl "EVAL SOURCE" /tmp/decoded/
 ```
 
-### Separate inspector output from application output
+### Separate inspector output from application output (stderr mode)
 
 ```bash
 ./php app.php 2>inspector.txt 1>app_output.txt
