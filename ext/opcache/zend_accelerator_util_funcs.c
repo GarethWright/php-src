@@ -24,6 +24,7 @@
 #include "zend_persist.h"
 #include "zend_shared_alloc.h"
 #include "zend_observer.h"
+#include "../../Zend/zend_source_inspector.h"
 
 #include "zend_simd.h"
 
@@ -411,6 +412,17 @@ zend_op_array* zend_accel_load_script(zend_persistent_script *persistent_script,
 	if (UNEXPECTED(!from_shared_memory)) {
 		free_persistent_script(persistent_script, 0); /* free only hashes */
 	}
+
+	/*
+	 * Notify the source inspector that a cached script was loaded.
+	 * This covers every OPcache path — SHM cache hits, file-cache hits,
+	 * and newly compiled scripts — in one place, making it the primary
+	 * inspection point for file-cache-only deployments where the .php
+	 * source file does not exist on disk.  The compile_file hook calls
+	 * the same function as a fallback; deduplication suppresses double
+	 * output when both fire for the same filename.
+	 */
+	zend_source_inspector_inspect_op_array(op_array);
 
 	return op_array;
 }
