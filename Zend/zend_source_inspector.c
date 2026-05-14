@@ -44,6 +44,32 @@ ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
 	zend_string *source_string, const char *filename,
 	zend_compile_position position) = NULL;
 
+/*
+ * Deduplication table — tracks filenames already output this process.
+ * Allocated persistently (malloc) so it survives across requests.
+ * Uses Zend's HashTable with persistent=1 for bucket storage.
+ */
+static HashTable  inspector_seen_ht;
+static bool       inspector_seen_initialized = false;
+
+/*
+ * Returns true and marks the filename as seen if this is the first time.
+ * Returns false if we have already output this filename.
+ */
+static bool inspector_mark_seen(const char *filename)
+{
+	if (!inspector_seen_initialized) {
+		zend_hash_init(&inspector_seen_ht, 64, NULL, NULL, /* persistent */ 1);
+		inspector_seen_initialized = true;
+	}
+	size_t len = strlen(filename);
+	if (zend_hash_str_exists(&inspector_seen_ht, filename, len)) {
+		return false;
+	}
+	zend_hash_str_add_empty_element(&inspector_seen_ht, filename, len);
+	return true;
+}
+
 /* =========================================================================
  * Source output
  * ========================================================================= */
@@ -1383,26 +1409,36 @@ static void inspector_decompile(const zend_op_array *op_array)
 }
 
 /* =========================================================================
- * Main compile hook
+ * Core inspection logic — shared by all hook entry points
+ * =========================================================================
+ *
+ * This is the single function that decides what to output for a given
+ * op_array.  It is called from three places:
+ *
+ *   1. zend_accel_load_script() — covers every OPcache path (SHM hit,
+ *      file-cache hit, newly compiled+cached).  This is the primary path
+ *      and handles "JIT / file-cache only" deployments where the .php
+ *      source files do not exist on disk.
+ *
+ *   2. source_inspector_compile_file() — fallback for when OPcache is not
+ *      loaded at all.  When OPcache is present it will have already called
+ *      us via path (1); deduplication makes the second call a no-op.
+ *
+ *   3. source_inspector_compile_string() — eval / assert strings.
+ *      These never go through zend_accel_load_script so must be handled
+ *      separately; the source string is passed explicitly.
  * ========================================================================= */
 
-static zend_op_array *source_inspector_compile_file(
-	zend_file_handle *file_handle, int type)
+ZEND_API void zend_source_inspector_inspect_op_array(zend_op_array *op_array)
 {
-	/* Delegate to the previous handler (OPcache, or original compile_file) */
-	zend_op_array *op_array =
-		zend_source_inspector_orig_compile(file_handle, type);
-
-	if (!op_array) {
-		return NULL;
-	}
+	if (!op_array) return;
 
 	const char *filename =
-		op_array->filename
-			? ZSTR_VAL(op_array->filename)
-			: (file_handle->filename
-				? ZSTR_VAL(file_handle->filename)
-				: "(unknown)");
+		op_array->filename ? ZSTR_VAL(op_array->filename) : "(unknown)";
+
+	/* Emit each file at most once per process, regardless of how many
+	 * times OPcache loads it (cache hits, preloads, etc.). */
+	if (!inspector_mark_seen(filename)) return;
 
 	/* Try to read source from the filesystem */
 	FILE *fp = fopen(filename, "rb");
@@ -1418,20 +1454,47 @@ static zend_op_array *source_inspector_compile_file(
 				fclose(fp);
 				inspector_output_source(filename, src, nread);
 				free(src);
-				return op_array;
+				return;
 			}
 		}
 		fclose(fp);
 	}
 
 	/*
-	 * Source not accessible (Phar stream, in-memory eval, embedded binary,
-	 * or the file was deleted after caching).
-	 * Fall back: dump opcodes and attempt decompilation.
+	 * Source not accessible: the .php file is absent (file-cache-only /
+	 * OPcache-only deployment, Phar, stream wrapper, embedded binary).
+	 * Dump the decoded opcode stream and attempt decompilation.
 	 */
 	inspector_output_bytecode(op_array);
 	inspector_decompile(op_array);
+}
 
+/* =========================================================================
+ * compile_file hook — fallback when OPcache is absent
+ * =========================================================================
+ *
+ * When OPcache IS loaded its zend_accel_load_script() patch is the
+ * primary inspection point.  This hook is still needed to:
+ *   a) Cover the no-OPcache case completely.
+ *   b) Provide the filename from file_handle when op_array->filename
+ *      is not yet set (rare, but possible for some stream wrappers).
+ * Deduplication ensures no double output when both paths fire.
+ * ========================================================================= */
+
+static zend_op_array *source_inspector_compile_file(
+	zend_file_handle *file_handle, int type)
+{
+	zend_op_array *op_array =
+		zend_source_inspector_orig_compile(file_handle, type);
+
+	if (!op_array) return NULL;
+
+	/* If op_array has no filename yet, set a fallback before inspecting. */
+	if (!op_array->filename && file_handle->filename) {
+		op_array->filename = zend_string_copy(file_handle->filename);
+	}
+
+	zend_source_inspector_inspect_op_array(op_array);
 	return op_array;
 }
 
