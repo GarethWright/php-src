@@ -40,6 +40,10 @@
 ZEND_API zend_op_array *(*zend_source_inspector_orig_compile)(
 	zend_file_handle *file_handle, int type) = NULL;
 
+ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
+	zend_string *source_string, const char *filename,
+	zend_compile_position position) = NULL;
+
 /* =========================================================================
  * Source output
  * ========================================================================= */
@@ -1432,16 +1436,59 @@ static zend_op_array *source_inspector_compile_file(
 }
 
 /* =========================================================================
+ * compile_string hook  (catches eval / preg_replace /e / assert strings)
+ * ========================================================================= */
+
+static zend_op_array *source_inspector_compile_string(
+	zend_string *source_string, const char *filename,
+	zend_compile_position position)
+{
+	zend_op_array *op_array =
+		zend_source_inspector_orig_compile_string(source_string, filename, position);
+
+	if (!op_array) {
+		return NULL;
+	}
+
+	/*
+	 * For eval'd strings the source is right here in `source_string`.
+	 * Output it as source (we always have it), then also dump bytecode so
+	 * the reader can see what the obfuscator's runtime payload looks like.
+	 */
+	const char *display_name = filename ? filename : "(eval)";
+
+	fprintf(stderr, "\n/* ===[ EVAL SOURCE: %s ]=== */\n", display_name);
+	if (ZSTR_LEN(source_string) > 0) {
+		fwrite(ZSTR_VAL(source_string), 1, ZSTR_LEN(source_string), stderr);
+		if (ZSTR_VAL(source_string)[ZSTR_LEN(source_string) - 1] != '\n') {
+			fputc('\n', stderr);
+		}
+	}
+	fprintf(stderr, "/* ===[ END EVAL SOURCE: %s ]=== */\n", display_name);
+
+	/* Always dump bytecode for eval — lets us see the compiled form even
+	 * when the source is garbled by an obfuscator's runtime decryptor. */
+	inspector_output_bytecode(op_array);
+	inspector_decompile(op_array);
+
+	fflush(stderr);
+	return op_array;
+}
+
+/* =========================================================================
  * Hook installation / removal
  * ========================================================================= */
 
 ZEND_API void zend_source_inspector_install(void)
 {
-	if (zend_compile_file == source_inspector_compile_file) {
-		return; /* already installed */
+	if (zend_compile_file != source_inspector_compile_file) {
+		zend_source_inspector_orig_compile = zend_compile_file;
+		zend_compile_file = source_inspector_compile_file;
 	}
-	zend_source_inspector_orig_compile = zend_compile_file;
-	zend_compile_file = source_inspector_compile_file;
+	if (zend_compile_string != source_inspector_compile_string) {
+		zend_source_inspector_orig_compile_string = zend_compile_string;
+		zend_compile_string = source_inspector_compile_string;
+	}
 }
 
 ZEND_API void zend_source_inspector_uninstall(void)
@@ -1450,5 +1497,10 @@ ZEND_API void zend_source_inspector_uninstall(void)
 	    zend_source_inspector_orig_compile != NULL) {
 		zend_compile_file = zend_source_inspector_orig_compile;
 		zend_source_inspector_orig_compile = NULL;
+	}
+	if (zend_compile_string == source_inspector_compile_string &&
+	    zend_source_inspector_orig_compile_string != NULL) {
+		zend_compile_string = zend_source_inspector_orig_compile_string;
+		zend_source_inspector_orig_compile_string = NULL;
 	}
 }

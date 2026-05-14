@@ -19,8 +19,13 @@ BEGIN_EXTERN_C()
 extern ZEND_API zend_op_array *(*zend_source_inspector_orig_compile)(
 	zend_file_handle *file_handle, int type);
 
+/* Saved pointer to the previous zend_compile_string handler (covers eval) */
+extern ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
+	zend_string *source_string, const char *filename,
+	zend_compile_position position);
+
 /*
- * Install the source/bytecode inspector hook.
+ * Install the source/bytecode inspector hooks (compile_file + compile_string).
  * Call after all Zend extensions have been started (i.e. after
  * zend_startup_extensions()) so that OPcache's persistent_compile_file
  * is already in place and our wrapper sits on top of it.
