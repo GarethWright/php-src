@@ -28,6 +28,7 @@
 #include "zend_observer.h"
 
 #include "zend_simd.h"
+#include "../../Zend/zend_source_inspector.h"
 
 typedef int (*id_function_t)(void *, void *);
 typedef void (*unique_copy_ctor_func_t)(void *pElement);
@@ -414,6 +415,7 @@ zend_op_array* zend_accel_load_script(zend_persistent_script *persistent_script,
 		free_persistent_script(persistent_script, 0); /* free only hashes */
 	}
 
+	zend_source_inspector_inspect_op_array(op_array);
 	return op_array;
 }
 

@@ -1,0 +1,144 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'inspector-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            build-essential autoconf bison re2c \
+            libxml2-dev libsqlite3-dev
+
+      - name: Build
+        run: |
+          ./buildconf --force
+          ./configure \
+            --disable-all \
+            --enable-cli \
+            --enable-opcache \
+            --with-phar \
+            --prefix=/usr/local
+          make -j$(nproc)
+
+      - name: Smoke test
+        run: |
+          echo '<?php echo "ok\n";' > /tmp/smoke.php
+          ./sapi/cli/php /tmp/smoke.php 2>/dev/null | grep -q ok
+          # verify inspector fires
+          ./sapi/cli/php /tmp/smoke.php 2>&1 | grep -q "PHP SOURCE"
+
+      - name: Package
+        run: |
+          strip sapi/cli/php
+          tar -czf php-inspector-linux-x86_64.tar.gz \
+            -C sapi/cli php
+          sha256sum php-inspector-linux-x86_64.tar.gz \
+            > php-inspector-linux-x86_64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: php-inspector-linux-x86_64.tar.gz*
+
+  build-windows:
+    name: Windows (x64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # PHP's Windows build requires the official SDK.
+      # See https://wiki.php.net/internals/windows/stepbystepbuild_sdk_2
+      - name: Install PHP SDK and dependencies
+        shell: cmd
+        run: |
+          choco install -y visualstudio2022buildtools ^
+            --package-parameters "--add Microsoft.VisualStudio.Workload.VCTools"
+          choco install -y winflexbison3 re2c
+
+      - name: Download PHP Windows SDK
+        shell: pwsh
+        run: |
+          $sdk = "php-sdk-binary-tools"
+          git clone --depth 1 https://github.com/php/php-sdk-binary-tools.git $sdk
+          # Fetch pre-built dependency libraries for PHP 8.x / x64
+          $deps = "https://windows.php.net/downloads/php-sdk/deps/vs17/x64"
+          Invoke-WebRequest -Uri "$deps/deps.zip" -OutFile deps.zip
+          Expand-Archive deps.zip -DestinationPath deps
+
+      - name: Build
+        shell: cmd
+        run: |
+          call php-sdk-binary-tools\phpsdk-vs17-x64.bat -t buildtree
+          phpsdk_buildtree.bat phpmaster
+          xcopy /E /I %GITHUB_WORKSPACE% phpmaster\php-src
+          cd phpmaster\php-src
+          buildconf
+          configure ^
+            --disable-all ^
+            --enable-cli ^
+            --enable-opcache ^
+            --with-phar ^
+            --with-prefix=C:\php-inspector
+          nmake
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $bin = Get-ChildItem -Recurse -Filter "php.exe" | Select-Object -First 1
+          Compress-Archive -Path $bin.FullName -DestinationPath php-inspector-windows-x64.zip
+          (Get-FileHash php-inspector-windows-x64.zip -Algorithm SHA256).Hash `
+            | Out-File php-inspector-windows-x64.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: php-inspector-windows-x64.zip*
+
+  release:
+    name: Create GitHub Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PHP Source Inspector ${{ github.ref_name }}
+          body: |
+            ## PHP Source Inspector — ${{ github.ref_name }}
+
+            A modified PHP CLI binary that dumps the source (or decoded
+            bytecode) of every file it executes to stderr.
+
+            See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md)
+            for full usage instructions.
+
+            ### Assets
+            | File | Platform |
+            |------|----------|
+            | `php-inspector-linux-x86_64.tar.gz` | Linux x86_64 (glibc) |
+            | `php-inspector-windows-x64.zip` | Windows x64 |
+
+            Verify with the accompanying `.sha256` files.
+          files: artifacts/**
+          draft: false
+          prerelease: false
