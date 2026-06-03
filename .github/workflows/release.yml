@@ -1,9 +1,9 @@
-name: Build Release
+name: Build Release (PHP 8.6)
 
 on:
   push:
     tags:
-      - 'inspector-v*'
+      - 'inspector-v*-php86'
   workflow_dispatch:
 
 permissions:
@@ -44,15 +44,15 @@ jobs:
       - name: Package
         run: |
           strip sapi/cli/php
-          tar -czf php-inspector-linux-x86_64.tar.gz \
+          tar -czf php-inspector-php86-linux-x86_64.tar.gz \
             -C sapi/cli php
-          sha256sum php-inspector-linux-x86_64.tar.gz \
-            > php-inspector-linux-x86_64.tar.gz.sha256
+          sha256sum php-inspector-php86-linux-x86_64.tar.gz \
+            > php-inspector-php86-linux-x86_64.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: php-inspector-linux-x86_64.tar.gz*
+          path: php-inspector-php86-linux-x86_64.tar.gz*
 
   build-windows:
     name: Windows (x64)
@@ -99,14 +99,14 @@ jobs:
         shell: pwsh
         run: |
           $bin = Get-ChildItem -Recurse -Filter "php.exe" | Select-Object -First 1
-          Compress-Archive -Path $bin.FullName -DestinationPath php-inspector-windows-x64.zip
-          (Get-FileHash php-inspector-windows-x64.zip -Algorithm SHA256).Hash `
-            | Out-File php-inspector-windows-x64.zip.sha256
+          Compress-Archive -Path $bin.FullName -DestinationPath php-inspector-php86-windows-x64.zip
+          (Get-FileHash php-inspector-php86-windows-x64.zip -Algorithm SHA256).Hash `
+            | Out-File php-inspector-php86-windows-x64.zip.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: php-inspector-windows-x64.zip*
+          path: php-inspector-php86-windows-x64.zip*
 
   release:
     name: Create GitHub Release
@@ -135,8 +135,8 @@ jobs:
             ### Assets
             | File | Platform |
             |------|----------|
-            | `php-inspector-linux-x86_64.tar.gz` | Linux x86_64 (glibc) |
-            | `php-inspector-windows-x64.zip` | Windows x64 |
+            | `php-inspector-php86-linux-x86_64.tar.gz` | Linux x86_64 (glibc) |
+            | `php-inspector-php86-windows-x64.zip` | Windows x64 |
 
             Verify with the accompanying `.sha256` files.
           files: artifacts/**
