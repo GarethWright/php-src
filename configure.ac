@@ -1763,6 +1763,7 @@ PHP_ADD_SOURCES([Zend], m4_normalize([
     zend_variables.c
     zend_virtual_cwd.c
     zend_vm_opcodes.c
+    zend_source_inspector.c
     zend_weakrefs.c
     zend.c
   ]),

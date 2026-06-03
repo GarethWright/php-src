@@ -67,6 +67,7 @@
 #endif
 
 #include "zend_compile.h"
+#include "zend_source_inspector.h"
 #include "zend_execute.h"
 #include "zend_highlight.h"
 #include "zend_extensions.h"
@@ -2290,6 +2291,14 @@ zend_result php_module_startup(sapi_module_struct *sf, zend_module_entry *additi
 
 	/* start Zend extensions */
 	zend_startup_extensions();
+
+	/*
+	 * Install the source/bytecode inspector hook AFTER all Zend extensions
+	 * (including OPcache) have started and possibly replaced zend_compile_file.
+	 * Our wrapper sits on top of whatever is currently in zend_compile_file,
+	 * so OPcache cache-hits still flow through us for source/opcode output.
+	 */
+	zend_source_inspector_install();
 
 	zend_collect_module_handlers();
 

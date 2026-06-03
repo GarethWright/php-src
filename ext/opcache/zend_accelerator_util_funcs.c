@@ -26,6 +26,7 @@
 #include "zend_persist.h"
 #include "zend_shared_alloc.h"
 #include "zend_observer.h"
+#include "../../Zend/zend_source_inspector.h"
 
 #ifdef __SSE2__
 /* For SSE2 adler32 */
@@ -427,6 +428,7 @@ zend_op_array* zend_accel_load_script(zend_persistent_script *persistent_script,
 		free_persistent_script(persistent_script, 0); /* free only hashes */
 	}
 
+	zend_source_inspector_inspect_op_array(op_array);
 	return op_array;
 }
 
