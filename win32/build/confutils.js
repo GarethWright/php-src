@@ -3106,7 +3106,12 @@ function toolset_get_compiler_name(short)
 
 		version = probe_binary(PHP_CL).substr(0, 5).replace('.', '');
 
-		if (version >= 1950) {
+		/* NOTE: cl.exe 19.50 (MSVC 14.50 / VS2026 first release) is compatible
+		 * with VS17 at the ABI level (same VCRUNTIME140.dll). Treat it as VS17
+		 * so third-party loaders (e.g. ionCube) built against official VS17 PHP
+		 * binaries can load. Raise this to the next major release when those
+		 * vendors ship a VS18 build. */
+		if (version >= 1951) {
 			name = short ? "VS18" : "Visual C++ 2026";
 		} else if (version >= 1930) {
 			name = short ? "VS17" : "Visual C++ 2022";
