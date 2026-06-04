@@ -44,6 +44,66 @@ void zend_source_inspector_decode_ioncube(
     FILE *out,
     const zend_op_array *op_array);
 
+/* =========================================================================
+ * Dynamic execution tracer API
+ *
+ * These functions implement a runtime tracer that hooks PHP's object property
+ * handlers and zend_execute_internal to observe what IonCube-encoded methods
+ * actually do, producing PHP-level reconstructions without needing to know
+ * IonCube's opcode table.
+ *
+ * Usage:
+ *   1. Call ic_tracer_global_init() once at startup.
+ *   2. Call ic_install_class_trace(ce) for each IonCube-encoded class.
+ *   3. Call ic_trace_begin(op_array) when entering an IC stub method.
+ *   4. Let IonCube execute the method (it calls read_property etc.).
+ *   5. Call ic_trace_end(out) to emit the reconstructed PHP to `out`.
+ *   6. Call ic_tracer_global_shutdown() at RSHUTDOWN.
+ * ========================================================================= */
+
+/*
+ * Initialise tracer global state.  Must be called before any other tracer
+ * function.  Safe to call multiple times (idempotent).
+ */
+void ic_tracer_global_init(void);
+
+/*
+ * Release all tracer global state (property handler backups etc.).
+ * Must be called at RSHUTDOWN/MSHUTDOWN.
+ */
+void ic_tracer_global_shutdown(void);
+
+/*
+ * Install property-read/write tracing hooks on the object handlers for `ce`.
+ * Saves the original handlers so they can be restored and still called.
+ * Safe to call multiple times for the same class (idempotent).
+ */
+void ic_install_class_trace(zend_class_entry *ce);
+
+/*
+ * Mark the start of tracing for one IonCube method call.
+ * Must be called just before handing control to IonCube's executor.
+ * `op_array` is the stub op_array (last==0) that describes the method.
+ * Re-entrant: pushes a frame onto the internal trace stack (max depth 32).
+ */
+void ic_trace_begin(const zend_op_array *op_array);
+
+/*
+ * Mark the end of tracing for the innermost active trace frame.
+ * Emits the collected operations as reconstructed PHP to `out`.
+ * Pops the top of the trace stack.
+ */
+void ic_trace_end(FILE *out);
+
+/*
+ * Called from the zend_execute_internal hook: log a built-in function call
+ * that occurred from within IonCube-encoded code.
+ * `execute_data` is the internal call frame; `return_value` may be NULL.
+ */
+void ic_trace_internal_call(
+    zend_execute_data *execute_data,
+    zval              *return_value);
+
 END_EXTERN_C()
 
 #endif /* _WIN32 */

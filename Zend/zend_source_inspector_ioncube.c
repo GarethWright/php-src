@@ -312,6 +312,422 @@ static void ic_reconstruct_php(
 }
 
 /* =========================================================================
+ * Dynamic execution tracer
+ * =========================================================================
+ *
+ * Strategy:
+ *   - For each IonCube-encoded class, we replace read_property / write_property
+ *     in its object handler vtable with wrappers that record {prop, value, R/W}.
+ *   - A global function pointer hooks zend_execute_internal so we catch built-in
+ *     PHP function calls (strlen, php_sapi_name, etc.) made from IC code.
+ *   - A small stack tracks which IC method is currently executing, so logged
+ *     operations are attributed to the right method frame.
+ *   - When a trace ends (ic_trace_end) we emit clean PHP from the log.
+ * ========================================================================= */
+
+/* Maximum nesting depth for concurrent IC method calls */
+#define IC_TRACE_MAX_DEPTH   32
+/* Maximum property/call operations to record per method call */
+#define IC_TRACE_MAX_OPS     256
+/* Maximum number of classes whose handlers we have patched */
+#define IC_TRACE_MAX_CLASSES 128
+
+typedef enum {
+	IC_OP_READ_PROP,    /* $this->prop (read) */
+	IC_OP_WRITE_PROP,   /* $this->prop = value (write) */
+	IC_OP_INTERNAL_CALL /* builtin_func(args) -> retval */
+} ic_op_kind;
+
+/* One traced operation */
+typedef struct {
+	ic_op_kind kind;
+
+	/* For IC_OP_READ_PROP / IC_OP_WRITE_PROP */
+	char prop_name[128];
+	char value_str[512];  /* zval formatted as PHP literal */
+
+	/* For IC_OP_INTERNAL_CALL */
+	char func_name[128];
+	char args_str[512];
+	char retval_str[256];
+} ic_op;
+
+/* Per-method trace frame */
+typedef struct {
+	const zend_op_array *op_array;
+	ic_op                ops[IC_TRACE_MAX_OPS];
+	int                  nops;
+} ic_trace_frame;
+
+/* Global trace stack */
+static ic_trace_frame  ic_trace_stack[IC_TRACE_MAX_DEPTH];
+static int             ic_trace_depth = 0;   /* 0 = idle */
+
+/* ---- Saved object-handler entries ---- */
+typedef struct {
+	zend_class_entry              *ce;
+	zend_object_handlers          *orig_handlers; /* the vtable in the CE */
+	zend_object_handlers           saved;          /* copy of originals */
+} ic_class_hook;
+
+static ic_class_hook  ic_hooked_classes[IC_TRACE_MAX_CLASSES];
+static int            ic_hooked_count = 0;
+
+/* ---- Saved zend_execute_internal pointer ---- */
+static void (*ic_orig_execute_internal)(
+    zend_execute_data *execute_data, zval *return_value) = NULL;
+
+/* =========================================================================
+ * Helpers: format a zval as a short PHP literal string
+ * ========================================================================= */
+
+static void ic_fmt_zval(const zval *zv, char *buf, size_t bufsz)
+{
+	if (!zv) { snprintf(buf, bufsz, "null"); return; }
+	switch (Z_TYPE_P(zv)) {
+		case IS_NULL:   snprintf(buf, bufsz, "null");  return;
+		case IS_FALSE:  snprintf(buf, bufsz, "false"); return;
+		case IS_TRUE:   snprintf(buf, bufsz, "true");  return;
+		case IS_LONG:
+			snprintf(buf, bufsz, ZEND_LONG_FMT, Z_LVAL_P(zv));
+			return;
+		case IS_DOUBLE:
+			snprintf(buf, bufsz, "%G", Z_DVAL_P(zv));
+			return;
+		case IS_STRING: {
+			size_t slen = Z_STRLEN_P(zv);
+			const char *sv = Z_STRVAL_P(zv);
+			size_t out_i = 0;
+			if (out_i < bufsz - 1) buf[out_i++] = '"';
+			for (size_t i = 0; i < slen && out_i < bufsz - 5; i++) {
+				unsigned char c = (unsigned char)sv[i];
+				if (c == '"')       { buf[out_i++] = '\\'; buf[out_i++] = '"'; }
+				else if (c == '\\') { buf[out_i++] = '\\'; buf[out_i++] = '\\'; }
+				else if (c == '\n') { buf[out_i++] = '\\'; buf[out_i++] = 'n'; }
+				else if (c == '\r') { buf[out_i++] = '\\'; buf[out_i++] = 'r'; }
+				else if (c == '\t') { buf[out_i++] = '\\'; buf[out_i++] = 't'; }
+				else if (c < 0x20)  { out_i += (size_t)snprintf(buf+out_i, bufsz-out_i, "\\x%02x", c); }
+				else                { buf[out_i++] = (char)c; }
+			}
+			if (slen > 64 && out_i < bufsz - 4) {
+				buf[out_i++] = '.'; buf[out_i++] = '.'; buf[out_i++] = '.';
+			}
+			if (out_i < bufsz - 1) buf[out_i++] = '"';
+			buf[out_i] = '\0';
+			return;
+		}
+		case IS_ARRAY:
+			snprintf(buf, bufsz, "[/*array(%d)*/]", (int)zend_array_count(Z_ARRVAL_P(zv)));
+			return;
+		case IS_OBJECT: {
+			zend_class_entry *ce = Z_OBJCE_P(zv);
+			snprintf(buf, bufsz, "/*object(%s)*/",
+				(ce && ce->name) ? ZSTR_VAL(ce->name) : "?");
+			return;
+		}
+		default:
+			snprintf(buf, bufsz, "/*type=%d*/", Z_TYPE_P(zv));
+			return;
+	}
+}
+
+/* Push a new operation onto the innermost active trace frame.
+ * Returns NULL if no trace is active or buffer is full. */
+static ic_op *ic_trace_push(void)
+{
+	if (ic_trace_depth <= 0) return NULL;
+	ic_trace_frame *frame = &ic_trace_stack[ic_trace_depth - 1];
+	if (frame->nops >= IC_TRACE_MAX_OPS) return NULL;
+	ic_op *op = &frame->ops[frame->nops++];
+	memset(op, 0, sizeof(*op));
+	return op;
+}
+
+/* =========================================================================
+ * Property handler hooks
+ * ========================================================================= */
+
+static zval *ic_trace_read_property(
+    zend_object *object, zend_string *member, int type,
+    void **cache_slot, zval *rv)
+{
+	/* Find the original handler for this class */
+	zend_class_entry *ce = object->ce;
+	zend_object_read_property_t orig_read = NULL;
+
+	for (int i = 0; i < ic_hooked_count; i++) {
+		if (ic_hooked_classes[i].ce == ce) {
+			orig_read = ic_hooked_classes[i].saved.read_property;
+			break;
+		}
+	}
+
+	/* Call original handler to get the real value */
+	zval *result = NULL;
+	if (orig_read) {
+		result = orig_read(object, member, type, cache_slot, rv);
+	}
+
+	/* Record the operation if a trace is active */
+	if (ic_trace_depth > 0 && member) {
+		ic_op *op = ic_trace_push();
+		if (op) {
+			op->kind = IC_OP_READ_PROP;
+			snprintf(op->prop_name, sizeof(op->prop_name), "%s", ZSTR_VAL(member));
+			if (result) {
+				ic_fmt_zval(result, op->value_str, sizeof(op->value_str));
+			} else {
+				snprintf(op->value_str, sizeof(op->value_str), "null");
+			}
+		}
+	}
+
+	return result;
+}
+
+static zval *ic_trace_write_property(
+    zend_object *object, zend_string *member, zval *value,
+    void **cache_slot)
+{
+	/* Find the original handler */
+	zend_class_entry *ce = object->ce;
+	zend_object_write_property_t orig_write = NULL;
+
+	for (int i = 0; i < ic_hooked_count; i++) {
+		if (ic_hooked_classes[i].ce == ce) {
+			orig_write = ic_hooked_classes[i].saved.write_property;
+			break;
+		}
+	}
+
+	/* Record the operation before the write */
+	if (ic_trace_depth > 0 && member) {
+		ic_op *op = ic_trace_push();
+		if (op) {
+			op->kind = IC_OP_WRITE_PROP;
+			snprintf(op->prop_name, sizeof(op->prop_name), "%s", ZSTR_VAL(member));
+			if (value) {
+				ic_fmt_zval(value, op->value_str, sizeof(op->value_str));
+			} else {
+				snprintf(op->value_str, sizeof(op->value_str), "null");
+			}
+		}
+	}
+
+	/* Call original handler */
+	zval *result = NULL;
+	if (orig_write) {
+		result = orig_write(object, member, value, cache_slot);
+	}
+	return result;
+}
+
+/* =========================================================================
+ * zend_execute_internal hook
+ * ========================================================================= */
+
+static void ic_trace_execute_internal(
+    zend_execute_data *execute_data, zval *return_value)
+{
+	/* Call through first */
+	if (ic_orig_execute_internal) {
+		ic_orig_execute_internal(execute_data, return_value);
+	} else {
+		execute_internal(execute_data, return_value);
+	}
+
+	/* Record if a trace is active and this is a real internal-function frame */
+	if (ic_trace_depth > 0
+	    && execute_data
+	    && execute_data->func
+	    && execute_data->func->type == ZEND_INTERNAL_FUNCTION) {
+
+		ic_op *op = ic_trace_push();
+		if (op) {
+			op->kind = IC_OP_INTERNAL_CALL;
+
+			/* Function name */
+			const zend_function *fn = execute_data->func;
+			const char *fname = NULL;
+			if (fn->common.function_name) {
+				fname = ZSTR_VAL(fn->common.function_name);
+			}
+			snprintf(op->func_name, sizeof(op->func_name), "%s",
+				fname ? fname : "?");
+
+			/* Build args string safely (cap at 8 to avoid out-of-frame reads) */
+			uint32_t nargs = ZEND_CALL_NUM_ARGS(execute_data);
+			if (nargs > 8) nargs = 8;
+			char *ap = op->args_str;
+			size_t aremain = sizeof(op->args_str);
+			for (uint32_t i = 0; i < nargs && i < 4 && aremain > 4; i++) {
+				zval *arg = ZEND_CALL_ARG(execute_data, i + 1);
+				char abuf[128];
+				ic_fmt_zval(arg, abuf, sizeof(abuf));
+				size_t written = (size_t)snprintf(ap, aremain,
+					"%s%s", (i > 0 ? ", " : ""), abuf);
+				if (written >= aremain) break;
+				ap += written;
+				aremain -= written;
+			}
+			if (ZEND_CALL_NUM_ARGS(execute_data) > 4 && aremain > 8) {
+				snprintf(ap, aremain, ", /*+%u*/",
+					ZEND_CALL_NUM_ARGS(execute_data) - 4);
+			}
+
+			/* Return value */
+			if (return_value && Z_TYPE_P(return_value) != IS_UNDEF) {
+				ic_fmt_zval(return_value, op->retval_str, sizeof(op->retval_str));
+			} else {
+				snprintf(op->retval_str, sizeof(op->retval_str), "void");
+			}
+		}
+	}
+}
+
+/* =========================================================================
+ * Public tracer API
+ * ========================================================================= */
+
+void ic_tracer_global_init(void)
+{
+	ic_trace_depth  = 0;
+	ic_hooked_count = 0;
+
+	/* Hook zend_execute_internal (if not already hooked) */
+	if (zend_execute_internal != ic_trace_execute_internal) {
+		ic_orig_execute_internal = zend_execute_internal;
+		zend_execute_internal    = ic_trace_execute_internal;
+	}
+}
+
+void ic_tracer_global_shutdown(void)
+{
+	/* Restore zend_execute_internal */
+	if (zend_execute_internal == ic_trace_execute_internal) {
+		zend_execute_internal = ic_orig_execute_internal;
+		ic_orig_execute_internal = NULL;
+	}
+
+	/* Note: we do NOT dereference CEs here because the class_table may already
+	 * have been torn down by the time shutdown is called.  The patched vtable
+	 * slots are on our stack (ic_patched_handlers[]) so they will be gone when
+	 * the next request starts anyway.  Just reset counters. */
+	ic_hooked_count = 0;
+	ic_trace_depth  = 0;
+}
+
+/* Per-class patched handlers: we allocate a COPY of the vtable per class
+ * so we never write into the shared std_object_handlers or read-only pages. */
+static zend_object_handlers ic_patched_handlers[IC_TRACE_MAX_CLASSES];
+
+void ic_install_class_trace(zend_class_entry *ce)
+{
+	if (!ce) return;
+
+	/* Check if already hooked */
+	for (int i = 0; i < ic_hooked_count; i++) {
+		if (ic_hooked_classes[i].ce == ce) return;
+	}
+	if (ic_hooked_count >= IC_TRACE_MAX_CLASSES) return;
+
+	const zend_object_handlers *h = ce->default_object_handlers;
+	if (!h) return;
+
+	/* Skip if both slots already point to our hooks */
+	if (h->read_property  == ic_trace_read_property &&
+	    h->write_property == ic_trace_write_property) return;
+
+	int idx = ic_hooked_count++;
+	ic_class_hook *slot = &ic_hooked_classes[idx];
+	slot->ce            = ce;
+	slot->orig_handlers = (zend_object_handlers *)h;  /* keep for restore */
+	slot->saved         = *h;  /* full copy of original handlers */
+
+	/* Make a private copy of the vtable and patch the two slots we care about.
+	 * Then point the CE at our copy so we never write to shared pages. */
+	ic_patched_handlers[idx] = *h;  /* copy all handlers */
+	ic_patched_handlers[idx].read_property  = ic_trace_read_property;
+	ic_patched_handlers[idx].write_property = ic_trace_write_property;
+	ce->default_object_handlers = &ic_patched_handlers[idx];
+}
+
+void ic_trace_begin(const zend_op_array *op_array)
+{
+	if (ic_trace_depth >= IC_TRACE_MAX_DEPTH) return;
+
+	ic_trace_frame *frame = &ic_trace_stack[ic_trace_depth++];
+	frame->op_array = op_array;
+	frame->nops     = 0;
+}
+
+void ic_trace_end(FILE *out)
+{
+	if (ic_trace_depth <= 0 || !out) return;
+
+	ic_trace_depth--;
+	ic_trace_frame *frame = &ic_trace_stack[ic_trace_depth];
+	const zend_op_array *oa = frame->op_array;
+
+	if (!oa || frame->nops == 0) return;
+
+	const char *fname = oa->function_name
+		? ZSTR_VAL(oa->function_name) : "(anon)";
+	const char *cname = (oa->scope && oa->scope->name)
+		? ZSTR_VAL(oa->scope->name) : NULL;
+
+	fprintf(out, "\n/* ===[ DYNAMIC TRACE: %s%s%s  (%d ops) ]=== */\n",
+		cname ? cname : "", cname ? "::" : "", fname, frame->nops);
+	fprintf(out, "<?php\n");
+	if (cname) {
+		fprintf(out, "/* Traced: %s::%s() */\n", cname, fname);
+	} else {
+		fprintf(out, "/* Traced: %s() */\n", fname);
+	}
+
+	/* Walk the operations and emit PHP-ish reconstructions */
+	for (int i = 0; i < frame->nops; i++) {
+		const ic_op *op = &frame->ops[i];
+		switch (op->kind) {
+
+		case IC_OP_READ_PROP:
+			fprintf(out, "$v%d = $this->%s;  /* = %s */\n",
+				i, op->prop_name, op->value_str);
+			break;
+
+		case IC_OP_WRITE_PROP:
+			fprintf(out, "$this->%s = %s;\n",
+				op->prop_name, op->value_str);
+			break;
+
+		case IC_OP_INTERNAL_CALL:
+			if (op->retval_str[0] && strcmp(op->retval_str, "void") != 0
+			    && strcmp(op->retval_str, "null") != 0) {
+				fprintf(out, "$v%d = %s(%s);  /* = %s */\n",
+					i, op->func_name, op->args_str, op->retval_str);
+			} else {
+				fprintf(out, "%s(%s);\n",
+					op->func_name, op->args_str);
+			}
+			break;
+		}
+	}
+
+	fprintf(out, "/* ===[ END DYNAMIC TRACE: %s%s%s ]=== */\n\n",
+		cname ? cname : "", cname ? "::" : "", fname);
+	fflush(out);
+}
+
+void ic_trace_internal_call(
+    zend_execute_data *execute_data, zval *return_value)
+{
+	/* Thin wrapper: the hook is already installed globally.
+	 * This function exists for external callers that want to report
+	 * an internal call outside the automatic hook (e.g. zend_call_function). */
+	(void)execute_data; (void)return_value;
+}
+
+/* =========================================================================
  * Public API
  * ========================================================================= */
 

@@ -1757,10 +1757,34 @@ static void inspector_execute_ex(zend_execute_data *execute_data)
 			}
 		} else {
 #ifdef _WIN32
-			/* IonCube stub (last==0): decode at RSHUTDOWN via capture_tables(). */
-			char key[1024];
-			inspector_func_key(op_array, key, sizeof(key));
-			(void)inspector_mark_seen(key);
+			/* IonCube stub (last==0): start a dynamic trace, let IonCube run
+			 * the method (via our original execute_ex), then emit the trace.
+			 * Only trace named functions/methods, not top-level scripts. */
+			if (op_array->function_name) {
+				char key[1024];
+				inspector_func_key(op_array, key, sizeof(key));
+				(void)inspector_mark_seen(key);
+
+				/* Install property-access tracing for the scope (class) of this
+				 * method the first time we see it execute, so we catch reads and
+				 * writes from *this* method call and all subsequent ones. */
+				if (op_array->scope) {
+					ic_install_class_trace(op_array->scope);
+				}
+
+				/* Build a trace-output file path with "::TRACE" suffix */
+				char trace_key[1280];
+				snprintf(trace_key, sizeof(trace_key), "%s::TRACE", key);
+
+				ic_trace_begin(op_array);
+				inspector_orig_execute_ex(execute_data);
+
+				/* Emit trace output */
+				FILE *tout = inspector_open_output(trace_key);
+				ic_trace_end(tout);
+				inspector_close_output(tout);
+				return;   /* already called orig -- skip the call below */
+			}
 #endif
 		}
 	}
@@ -1810,6 +1834,10 @@ ZEND_API void zend_source_inspector_reinstall_hooks(void)
 				}
 			}
 		}
+
+		/* Initialise the dynamic execution tracer AFTER IonCube's RINIT,
+		 * so our zend_execute_internal hook sits on top of IonCube's. */
+		ic_tracer_global_init();
 #endif
 	}
 }
@@ -1912,6 +1940,28 @@ ZEND_API void zend_source_inspector_capture_tables(void)
 	zend_class_entry *ce;
 	ZEND_HASH_FOREACH_PTR(EG(class_table), ce) {
 		if (ce->type != ZEND_USER_CLASS) continue;
+
+#ifdef _WIN32
+		/* Check if this is an IonCube-encoded class: at least one method
+		 * has a stub op_array (last==0) with a non-NULL reserved[3].
+		 * Install property-access tracing hooks for such classes. */
+		{
+			bool is_ic_class = false;
+			zend_function *probe;
+			ZEND_HASH_FOREACH_PTR(&ce->function_table, probe) {
+				if (probe->type == ZEND_USER_FUNCTION &&
+				    probe->op_array.last == 0 &&
+				    probe->op_array.reserved[3] != NULL) {
+					is_ic_class = true;
+					break;
+				}
+			} ZEND_HASH_FOREACH_END();
+			if (is_ic_class) {
+				ic_install_class_trace(ce);
+			}
+		}
+#endif
+
 		zend_function *meth;
 		ZEND_HASH_FOREACH_PTR(&ce->function_table, meth) {
 			if (meth->type == ZEND_USER_FUNCTION) {
@@ -1939,6 +1989,12 @@ ZEND_API void zend_source_inspector_capture_tables(void)
 
 ZEND_API void zend_source_inspector_uninstall(void)
 {
+#ifdef _WIN32
+	/* Shut down the dynamic tracer before restoring the execute_internal hook
+	 * so the tracer's own hook cleanup runs first in the right order. */
+	ic_tracer_global_shutdown();
+#endif
+
 	zend_unregister_ini_entries_ex(INSPECTOR_MODULE_NUMBER, MODULE_PERSISTENT);
 	free(inspector_output_dir_cfg);
 	inspector_output_dir_cfg = NULL;
