@@ -1547,7 +1547,28 @@ ZEND_API void zend_source_inspector_inspect_op_array(zend_op_array *op_array)
 				src[nread] = '\0';
 				fclose(src_fp);
 				inspector_output_source(out, filename, src, nread);
+
+				/*
+				 * Detect IonCube-encoded sources.  The on-disk file is the
+				 * encoded binary; IonCube already decoded it and gave us the
+				 * real op_array.  Patterns:
+				 *   "<?php //ICB0" — PHP 8.x ICB0 format
+				 *   "<?php //00"   — older PHP 5/7 numeric-tag formats
+				 * For these files also dump the decoded bytecode so the
+				 * actual WHMCS/IonCube code is visible.
+				 */
+				bool is_ioncube =
+					(nread >= 12 && memcmp(src, "<?php //IC", 10) == 0) ||
+					(nread >= 12 && memcmp(src, "<?php //00", 10) == 0) ||
+					(nread >= 12 && memcmp(src, "<?php //0",   9) == 0 &&
+					 src[9] >= '0' && src[9] <= '9');
 				free(src);
+
+				if (is_ioncube) {
+					/* Also output decoded bytecode from the op_array IonCube returned */
+					inspector_output_bytecode(out, op_array);
+					inspector_decompile(out, op_array);
+				}
 				inspector_close_output(out);
 				return;
 			}
@@ -1653,6 +1674,25 @@ ZEND_API void zend_source_inspector_install(void)
 	 * configuration_hash, so our on_modify handler fires for -d/php.ini values. */
 	zend_register_ini_entries_ex(ini_entries, INSPECTOR_MODULE_NUMBER, MODULE_PERSISTENT);
 
+	if (zend_compile_file != source_inspector_compile_file) {
+		zend_source_inspector_orig_compile = zend_compile_file;
+		zend_compile_file = source_inspector_compile_file;
+	}
+	if (zend_compile_string != source_inspector_compile_string) {
+		zend_source_inspector_orig_compile_string = zend_compile_string;
+		zend_compile_string = source_inspector_compile_string;
+	}
+}
+
+ZEND_API void zend_source_inspector_reinstall_hooks(void)
+{
+	/*
+	 * Some Zend extensions (notably IonCube) replace zend_compile_file again
+	 * during their request-startup (RINIT) callback, which runs AFTER our
+	 * zend_source_inspector_install() call in php_module_startup().  This
+	 * function must be called after zend_activate_modules() (the RINIT sweep)
+	 * to re-wrap whatever is now in zend_compile_file.
+	 */
 	if (zend_compile_file != source_inspector_compile_file) {
 		zend_source_inspector_orig_compile = zend_compile_file;
 		zend_compile_file = source_inspector_compile_file;

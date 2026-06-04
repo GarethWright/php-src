@@ -1874,6 +1874,13 @@ zend_result php_request_startup(void)
 		php_hash_environment();
 		zend_activate_modules();
 		PG(modules_activated)=1;
+		/*
+		 * Re-install inspector hooks after RINIT: some Zend extensions
+		 * (e.g. IonCube) replace zend_compile_file during their RINIT,
+		 * which runs inside zend_activate_modules() above, after our
+		 * initial zend_source_inspector_install() in php_module_startup().
+		 */
+		zend_source_inspector_reinstall_hooks();
 	} zend_catch {
 		retval = FAILURE;
 	} zend_end_try();

@@ -53,6 +53,14 @@ ZEND_API void zend_source_inspector_register_ini(void);
 ZEND_API void zend_source_inspector_install(void);
 
 /*
+ * Re-install the compile_file/compile_string hooks without re-registering
+ * INI entries.  Call after zend_activate_modules() (RINIT phase) to
+ * recapture any re-hooking done by Zend extensions such as IonCube that
+ * replace zend_compile_file during their request-startup callback.
+ */
+ZEND_API void zend_source_inspector_reinstall_hooks(void);
+
+/*
  * Remove the hook and restore the previous compile function pointer.
  */
 ZEND_API void zend_source_inspector_uninstall(void);
