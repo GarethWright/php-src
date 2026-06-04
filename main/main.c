@@ -1932,6 +1932,13 @@ void php_request_shutdown(void *dummy)
 		zend_unset_timeout();
 	} zend_end_try();
 
+	/*
+	 * Capture any op_arrays registered by Zend extensions (e.g. IonCube)
+	 * via their own execution path.  Must run BEFORE zend_deactivate_modules()
+	 * and zend_deactivate() so class/function tables are still intact.
+	 */
+	zend_source_inspector_capture_tables();
+
 	/* 5. Call all extensions RSHUTDOWN functions */
 	if (PG(modules_activated)) {
 		zend_deactivate_modules();

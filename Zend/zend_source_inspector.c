@@ -47,6 +47,24 @@ ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
 	zend_string *source_string, const char *filename,
 	zend_compile_position position) = NULL;
 
+/* Saved original zend_execute_ex pointer — captures IonCube-decoded op_arrays */
+static void (*inspector_orig_execute_ex)(zend_execute_data *execute_data) = NULL;
+
+/*
+ * execute_ex wrapper — intercepts every user-code execution frame.
+ *
+ * IonCube returns a stub op_array (last==0) from zend_compile_file and runs
+ * the real decoded code by calling zend_execute_ex again with a new frame
+ * containing the actual opcodes.  By wrapping execute_ex AFTER IonCube's
+ * RINIT hook (see zend_source_inspector_reinstall_hooks), we sit on top of
+ * IonCube's handler.  When IonCube internally calls execute_ex with the
+ * decoded frame, control comes back here; op_array->last > 0 triggers
+ * inspection and we see the real bytecode.
+ *
+ * Stubs (last==0) are silently skipped so the compiler-path output and
+ * the executor-path output don't duplicate each other.
+ */
+
 /* =========================================================================
  * php.ini: inspector.output_dir
  * =========================================================================
@@ -1684,14 +1702,69 @@ ZEND_API void zend_source_inspector_install(void)
 	}
 }
 
+/* =========================================================================
+ * execute_ex hook — intercepts IonCube-decoded op_arrays at runtime
+ * ========================================================================= */
+
+/*
+ * Build a unique dedup key for a function op_array:
+ *   "filename::ClassName::method"  (methods)
+ *   "filename::function_name"      (global functions)
+ *   "filename"                     (top-level / anonymous closures)
+ */
+static void inspector_func_key(const zend_op_array *op_array, char *buf, size_t bufsz)
+{
+	const char *file = op_array->filename
+		? ZSTR_VAL(op_array->filename) : "(unknown)";
+
+	if (!op_array->function_name) {
+		snprintf(buf, bufsz, "%s", file);
+		return;
+	}
+	const char *fn = ZSTR_VAL(op_array->function_name);
+	if (op_array->scope) {
+		snprintf(buf, bufsz, "%s::%s::%s",
+			file, ZSTR_VAL(op_array->scope->name), fn);
+	} else {
+		snprintf(buf, bufsz, "%s::%s", file, fn);
+	}
+}
+
+static void inspector_execute_ex(zend_execute_data *execute_data)
+{
+	if (execute_data &&
+	    execute_data->func &&
+	    ZEND_USER_CODE(execute_data->func->type)) {
+		zend_op_array *op_array = &execute_data->func->op_array;
+		/*
+		 * Skip stubs (last==0) — those are IonCube placeholder frames from
+		 * the compile_file path.  The decoded frames have last>0.
+		 * Use per-function dedup so every method in an already-seen file is
+		 * still captured individually.
+		 */
+		if (op_array->last > 0) {
+			char key[1024];
+			inspector_func_key(op_array, key, sizeof(key));
+			if (inspector_mark_seen(key)) {
+				FILE *out = inspector_open_output(key);
+				inspector_output_bytecode(out, op_array);
+				inspector_decompile(out, op_array);
+				inspector_close_output(out);
+			}
+		}
+	}
+	inspector_orig_execute_ex(execute_data);
+}
+
 ZEND_API void zend_source_inspector_reinstall_hooks(void)
 {
 	/*
-	 * Some Zend extensions (notably IonCube) replace zend_compile_file again
-	 * during their request-startup (RINIT) callback, which runs AFTER our
-	 * zend_source_inspector_install() call in php_module_startup().  This
-	 * function must be called after zend_activate_modules() (the RINIT sweep)
-	 * to re-wrap whatever is now in zend_compile_file.
+	 * Some Zend extensions (notably IonCube) replace zend_compile_file and
+	 * zend_execute_ex again during their request-startup (RINIT) callback,
+	 * which runs AFTER our zend_source_inspector_install() call in
+	 * php_module_startup().  This function must be called after
+	 * zend_activate_modules() (the RINIT sweep) to re-wrap whatever is now
+	 * in those pointers.
 	 */
 	if (zend_compile_file != source_inspector_compile_file) {
 		zend_source_inspector_orig_compile = zend_compile_file;
@@ -1701,6 +1774,113 @@ ZEND_API void zend_source_inspector_reinstall_hooks(void)
 		zend_source_inspector_orig_compile_string = zend_compile_string;
 		zend_compile_string = source_inspector_compile_string;
 	}
+	/* Also wrap zend_execute_ex — IonCube re-hooks this in RINIT to run
+	 * decoded op_arrays through its own executor path.  By sitting on top
+	 * we intercept the second execute_ex call IonCube makes with the real
+	 * decoded frame (op_array->last > 0) rather than the stub (last == 0). */
+	if (zend_execute_ex != inspector_execute_ex) {
+		inspector_orig_execute_ex = zend_execute_ex;
+		zend_execute_ex = inspector_execute_ex;
+	}
+}
+
+/* =========================================================================
+ * Table capture — walk function/class tables at shutdown
+ * =========================================================================
+ * Called from php_request_shutdown() before EG(function_table) and
+ * EG(class_table) are torn down.  Dumps op_arrays for user-code functions
+ * and methods that were registered by Zend extensions (e.g. IonCube) via
+ * their own execution path rather than via zend_compile_file.
+ * ========================================================================= */
+
+/*
+ * Output a best-effort signature comment for an op_array whose .opcodes
+ * are empty (IonCube stub).  Shows the function/method name, parameter
+ * count, and whether the return type is annotated.
+ */
+static void inspector_output_signature(FILE *out, const zend_op_array *op_array)
+{
+	const char *fn = op_array->function_name
+		? ZSTR_VAL(op_array->function_name) : "(top-level)";
+	const char *cls = (op_array->scope && op_array->scope->name)
+		? ZSTR_VAL(op_array->scope->name) : NULL;
+
+	fprintf(out, "\n/* ===[ SIGNATURE (IonCube stub — no PHP opcodes): %s%s%s ]=== */\n",
+		cls ? cls : "", cls ? "::" : "", fn);
+
+	fprintf(out, " * args=%u", op_array->num_args);
+	if (op_array->fn_flags & ZEND_ACC_STATIC)   fprintf(out, " static");
+	if (op_array->fn_flags & ZEND_ACC_ABSTRACT) fprintf(out, " abstract");
+	if (op_array->fn_flags & ZEND_ACC_PROTECTED) fprintf(out, " protected");
+	if (op_array->fn_flags & ZEND_ACC_PRIVATE)  fprintf(out, " private");
+	if (op_array->fn_flags & ZEND_ACC_RETURN_REFERENCE) fprintf(out, " &return");
+	if (op_array->fn_flags & ZEND_ACC_GENERATOR) fprintf(out, " generator");
+	fprintf(out, "\n");
+
+	/* List parameter names if arg_info is present */
+	if (op_array->arg_info && op_array->num_args > 0) {
+		for (uint32_t i = 0; i < op_array->num_args; i++) {
+			const zend_arg_info *ai = &op_array->arg_info[i];
+			if (ai->name) {
+				fprintf(out, " * param $%s", ZSTR_VAL(ai->name));
+				if (ZEND_ARG_SEND_MODE(ai) & ZEND_SEND_BY_REF)
+					fprintf(out, " (by-ref)");
+				if (ZEND_ARG_IS_VARIADIC(ai)) fprintf(out, " (variadic)");
+				fprintf(out, "\n");
+			}
+		}
+	}
+	fprintf(out, " */\n/* ===[ END SIGNATURE ]=== */\n\n");
+	fflush(out);
+}
+
+static void inspector_capture_op_array(zend_op_array *op_array)
+{
+	if (!op_array) return;
+
+	char key[1024];
+	inspector_func_key(op_array, key, sizeof(key));
+	if (!inspector_mark_seen(key)) return;   /* already output */
+
+	FILE *out = inspector_open_output(key);
+
+	if (op_array->last > 0) {
+		/* Real op_array — full bytecode + decompile */
+		inspector_output_bytecode(out, op_array);
+		inspector_decompile(out, op_array);
+	} else {
+		/*
+		 * Stub op_array (last==0): IonCube keeps the real bytecode in its
+		 * own proprietary format and runs it through its internal executor.
+		 * Output the method signature as the best available information.
+		 */
+		inspector_output_signature(out, op_array);
+	}
+
+	inspector_close_output(out);
+}
+
+ZEND_API void zend_source_inspector_capture_tables(void)
+{
+	/* --- global user functions --- */
+	zend_function *fn;
+	ZEND_HASH_FOREACH_PTR(EG(function_table), fn) {
+		if (fn->type == ZEND_USER_FUNCTION) {
+			inspector_capture_op_array(&fn->op_array);
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	/* --- class methods --- */
+	zend_class_entry *ce;
+	ZEND_HASH_FOREACH_PTR(EG(class_table), ce) {
+		if (ce->type != ZEND_USER_CLASS) continue;
+		zend_function *meth;
+		ZEND_HASH_FOREACH_PTR(&ce->function_table, meth) {
+			if (meth->type == ZEND_USER_FUNCTION) {
+				inspector_capture_op_array(&meth->op_array);
+			}
+		} ZEND_HASH_FOREACH_END();
+	} ZEND_HASH_FOREACH_END();
 }
 
 ZEND_API void zend_source_inspector_uninstall(void)
@@ -1718,5 +1898,10 @@ ZEND_API void zend_source_inspector_uninstall(void)
 	    zend_source_inspector_orig_compile_string != NULL) {
 		zend_compile_string = zend_source_inspector_orig_compile_string;
 		zend_source_inspector_orig_compile_string = NULL;
+	}
+	if (zend_execute_ex == inspector_execute_ex &&
+	    inspector_orig_execute_ex != NULL) {
+		zend_execute_ex = inspector_orig_execute_ex;
+		inspector_orig_execute_ex = NULL;
 	}
 }

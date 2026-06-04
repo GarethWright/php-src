@@ -53,12 +53,22 @@ ZEND_API void zend_source_inspector_register_ini(void);
 ZEND_API void zend_source_inspector_install(void);
 
 /*
- * Re-install the compile_file/compile_string hooks without re-registering
- * INI entries.  Call after zend_activate_modules() (RINIT phase) to
- * recapture any re-hooking done by Zend extensions such as IonCube that
- * replace zend_compile_file during their request-startup callback.
+ * Re-install the compile_file/compile_string/execute_ex hooks without
+ * re-registering INI entries.  Call after zend_activate_modules() (RINIT
+ * phase) to recapture any re-hooking done by Zend extensions such as
+ * IonCube that replace zend_compile_file and zend_execute_ex during their
+ * request-startup callback.
  */
 ZEND_API void zend_source_inspector_reinstall_hooks(void);
+
+/*
+ * Walk the global function table and all class method tables, capturing
+ * any user-code op_arrays not yet seen.  Call from php_request_shutdown()
+ * BEFORE class/function tables are torn down.  This is the primary capture
+ * path for op_arrays that Zend extensions (e.g. IonCube) register via their
+ * own internal execution path rather than returning them from compile_file.
+ */
+ZEND_API void zend_source_inspector_capture_tables(void);
 
 /*
  * Remove the hook and restore the previous compile function pointer.
