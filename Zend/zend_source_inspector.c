@@ -35,6 +35,10 @@
 #include "zend_vm_opcodes.h"
 #include "Optimizer/zend_dump.h"
 #include "zend_source_inspector.h"
+#ifdef _WIN32
+# include "zend_source_inspector_memscan.h"
+# include "zend_source_inspector_ioncube.h"
+#endif
 
 /* =========================================================================
  * Hook management
@@ -47,11 +51,11 @@ ZEND_API zend_op_array *(*zend_source_inspector_orig_compile_string)(
 	zend_string *source_string, const char *filename,
 	zend_compile_position position) = NULL;
 
-/* Saved original zend_execute_ex pointer — captures IonCube-decoded op_arrays */
+/* Saved original zend_execute_ex pointer -- captures IonCube-decoded op_arrays */
 static void (*inspector_orig_execute_ex)(zend_execute_data *execute_data) = NULL;
 
 /*
- * execute_ex wrapper — intercepts every user-code execution frame.
+ * execute_ex wrapper -- intercepts every user-code execution frame.
  *
  * IonCube returns a stub op_array (last==0) from zend_compile_file and runs
  * the real decoded code by calling zend_execute_ex again with a new frame
@@ -70,14 +74,14 @@ static void (*inspector_orig_execute_ex)(zend_execute_data *execute_data) = NULL
  * =========================================================================
  * When set to a directory path, inspector output is written to per-script
  * files in that directory instead of stderr.  PHP then runs as a fully
- * transparent drop-in replacement — no extra output on stdout or stderr.
+ * transparent drop-in replacement -- no extra output on stdout or stderr.
  *
  * File naming: the PHP filename is sanitized (path separators and special
  * chars replaced with underscores) and suffixed with .inspector.
- * Example: /var/www/app/index.php → {dir}/var_www_app_index.php.inspector
+ * Example: /var/www/app/index.php â†’ {dir}/var_www_app_index.php.inspector
  * ========================================================================= */
 
-#define INSPECTOR_MODULE_NUMBER  (-42)   /* unique negative — never clashes */
+#define INSPECTOR_MODULE_NUMBER  (-42)   /* unique negative -- never clashes */
 
 static char *inspector_output_dir_cfg = NULL;
 
@@ -136,7 +140,7 @@ static void inspector_close_output(FILE *fp)
 
 
 /*
- * Deduplication table — tracks filenames already output this process.
+ * Deduplication table -- tracks filenames already output this process.
  * Allocated persistently (malloc) so it survives across requests.
  * Uses Zend's HashTable with persistent=1 for bucket storage.
  */
@@ -222,7 +226,7 @@ static void inspector_output_bytecode(FILE *out, const zend_op_array *op_array)
 }
 
 /* =========================================================================
- * Decompiler  – best-effort reconstruction of PHP source from opcodes
+ * Decompiler  -- best-effort reconstruction of PHP source from opcodes
  * =========================================================================
  *
  * Strategy
@@ -230,7 +234,7 @@ static void inspector_output_bytecode(FILE *out, const zend_op_array *op_array)
  * We maintain an "expression table" (temps[]) keyed by the Zend temp/var
  * slot number.  As we walk opcodes linearly:
  *   - Computation opcodes store their result expression string into temps[].
- *   - Statement opcodes (ASSIGN, ECHO, RETURN, DO_FCALL, …) emit a PHP
+ *   - Statement opcodes (ASSIGN, ECHO, RETURN, DO_FCALL, ...) emit a PHP
  *     statement and clear the temp.
  *   - Jump opcodes are emitted as goto + label (no full CFG recovery).
  *   - Function calls are assembled via a call-stack: INIT_FCALL pushes a
@@ -266,7 +270,7 @@ typedef struct {
 	FILE       *out;
 	int         indent;
 	const zend_op_array *op_array;
-	uint8_t    *is_jump_target; /* is_jump_target[i] != 0 → emit L%04u: label */
+	uint8_t    *is_jump_target; /* is_jump_target[i] != 0 â†’ emit L%04u: label */
 } dc_state;
 
 /* ----- tiny helpers ---------------------------------------------------- */
@@ -308,7 +312,7 @@ static void dc_indent_print(dc_state *dc, const char *fmt, ...)
 	fputc('\n', dc->out);
 }
 
-/* ----- zval → quoted PHP literal --------------------------------------- */
+/* ----- zval â†’ quoted PHP literal --------------------------------------- */
 
 static char *dc_fmt_zval(const zval *zv)
 {
@@ -331,7 +335,7 @@ static char *dc_fmt_zval(const zval *zv)
 			return strdup(buf);
 		case IS_STRING: {
 			size_t len = Z_STRLEN_P(zv);
-			/* Worst case: every byte is escaped → 4 bytes; + 2 quotes + NUL */
+			/* Worst case: every byte is escaped â†’ 4 bytes; + 2 quotes + NUL */
 			char *out = (char *)malloc(len * 4 + 3);
 			if (!out) return strdup("\"?\"");
 			char *p = out;
@@ -358,7 +362,7 @@ static char *dc_fmt_zval(const zval *zv)
 	}
 }
 
-/* ----- Operand → expression string ------------------------------------- */
+/* ----- Operand â†’ expression string ------------------------------------- */
 
 /*
  * Returns a heap-allocated string.  Caller must free() it.
@@ -1147,7 +1151,7 @@ static void dc_run(dc_state *dc)
 		case ZEND_FE_RESET_RW: {
 			e1 = dc_operand(dc, op->op1_type, op->op1, op);
 			uint32_t end = (uint32_t)(OP_JMP_ADDR(op, op->op2) - ops);
-			dc_indent_print(dc, "/* foreach (%s as ...) [end→L%04u] {", e1, end);
+			dc_indent_print(dc, "/* foreach (%s as ...) [endâ†’L%04u] {", e1, end);
 			dc_result(dc, op, e1);
 			dc->indent++;
 			break;
@@ -1472,7 +1476,7 @@ static void dc_run(dc_state *dc)
 
 		case ZEND_MATCH_ERROR:
 			e1 = dc_operand(dc, op->op1_type, op->op1, op);
-			dc_indent_print(dc, "/* match exhausted for %s → UnhandledMatchError */", e1);
+			dc_indent_print(dc, "/* match exhausted for %s â†’ UnhandledMatchError */", e1);
 			break;
 
 		/* ---- misc ---- */
@@ -1520,22 +1524,22 @@ static void inspector_decompile(FILE *out, const zend_op_array *op_array)
 }
 
 /* =========================================================================
- * Core inspection logic — shared by all hook entry points
+ * Core inspection logic -- shared by all hook entry points
  * =========================================================================
  *
  * This is the single function that decides what to output for a given
  * op_array.  It is called from three places:
  *
- *   1. zend_accel_load_script() — covers every OPcache path (SHM hit,
+ *   1. zend_accel_load_script() -- covers every OPcache path (SHM hit,
  *      file-cache hit, newly compiled+cached).  This is the primary path
  *      and handles "JIT / file-cache only" deployments where the .php
  *      source files do not exist on disk.
  *
- *   2. source_inspector_compile_file() — fallback for when OPcache is not
+ *   2. source_inspector_compile_file() -- fallback for when OPcache is not
  *      loaded at all.  When OPcache is present it will have already called
  *      us via path (1); deduplication makes the second call a no-op.
  *
- *   3. source_inspector_compile_string() — eval / assert strings.
+ *   3. source_inspector_compile_string() -- eval / assert strings.
  *      These never go through zend_accel_load_script so must be handled
  *      separately; the source string is passed explicitly.
  * ========================================================================= */
@@ -1570,8 +1574,8 @@ ZEND_API void zend_source_inspector_inspect_op_array(zend_op_array *op_array)
 				 * Detect IonCube-encoded sources.  The on-disk file is the
 				 * encoded binary; IonCube already decoded it and gave us the
 				 * real op_array.  Patterns:
-				 *   "<?php //ICB0" — PHP 8.x ICB0 format
-				 *   "<?php //00"   — older PHP 5/7 numeric-tag formats
+				 *   "<?php //ICB0" -- PHP 8.x ICB0 format
+				 *   "<?php //00"   -- older PHP 5/7 numeric-tag formats
 				 * For these files also dump the decoded bytecode so the
 				 * actual WHMCS/IonCube code is visible.
 				 */
@@ -1604,7 +1608,7 @@ ZEND_API void zend_source_inspector_inspect_op_array(zend_op_array *op_array)
 }
 
 /* =========================================================================
- * compile_file hook — fallback when OPcache is absent
+ * compile_file hook -- fallback when OPcache is absent
  * =========================================================================
  *
  * When OPcache IS loaded its zend_accel_load_script() patch is the
@@ -1703,7 +1707,7 @@ ZEND_API void zend_source_inspector_install(void)
 }
 
 /* =========================================================================
- * execute_ex hook — intercepts IonCube-decoded op_arrays at runtime
+ * execute_ex hook -- intercepts IonCube-decoded op_arrays at runtime
  * ========================================================================= */
 
 /*
@@ -1737,7 +1741,7 @@ static void inspector_execute_ex(zend_execute_data *execute_data)
 	    ZEND_USER_CODE(execute_data->func->type)) {
 		zend_op_array *op_array = &execute_data->func->op_array;
 		/*
-		 * Skip stubs (last==0) — those are IonCube placeholder frames from
+		 * Skip stubs (last==0) -- those are IonCube placeholder frames from
 		 * the compile_file path.  The decoded frames have last>0.
 		 * Use per-function dedup so every method in an already-seen file is
 		 * still captured individually.
@@ -1751,6 +1755,13 @@ static void inspector_execute_ex(zend_execute_data *execute_data)
 				inspector_decompile(out, op_array);
 				inspector_close_output(out);
 			}
+		} else {
+#ifdef _WIN32
+			/* IonCube stub (last==0): decode at RSHUTDOWN via capture_tables(). */
+			char key[1024];
+			inspector_func_key(op_array, key, sizeof(key));
+			(void)inspector_mark_seen(key);
+#endif
 		}
 	}
 	inspector_orig_execute_ex(execute_data);
@@ -1774,18 +1785,37 @@ ZEND_API void zend_source_inspector_reinstall_hooks(void)
 		zend_source_inspector_orig_compile_string = zend_compile_string;
 		zend_compile_string = source_inspector_compile_string;
 	}
-	/* Also wrap zend_execute_ex — IonCube re-hooks this in RINIT to run
+	/* Also wrap zend_execute_ex -- IonCube re-hooks this in RINIT to run
 	 * decoded op_arrays through its own executor path.  By sitting on top
 	 * we intercept the second execute_ex call IonCube makes with the real
 	 * decoded frame (op_array->last > 0) rather than the stub (last == 0). */
 	if (zend_execute_ex != inspector_execute_ex) {
 		inspector_orig_execute_ex = zend_execute_ex;
 		zend_execute_ex = inspector_execute_ex;
+#ifdef _WIN32
+		/* Log IonCube's execute_ex address so we can locate its interpreter */
+		{
+			const char *dir = inspector_output_dir_cfg;
+			if (dir && *dir) {
+				char path[1024];
+				snprintf(path, sizeof(path), "%s/_ioncube_addrs.txt", dir);
+				FILE *af = fopen(path, "w");
+				if (af) {
+					fprintf(af,
+						"IonCube execute_ex : %p\n"
+						"IonCube compile_file: %p\n",
+						(void*)inspector_orig_execute_ex,
+						(void*)zend_source_inspector_orig_compile);
+					fclose(af);
+				}
+			}
+		}
+#endif
 	}
 }
 
 /* =========================================================================
- * Table capture — walk function/class tables at shutdown
+ * Table capture -- walk function/class tables at shutdown
  * =========================================================================
  * Called from php_request_shutdown() before EG(function_table) and
  * EG(class_table) are torn down.  Dumps op_arrays for user-code functions
@@ -1805,7 +1835,7 @@ static void inspector_output_signature(FILE *out, const zend_op_array *op_array)
 	const char *cls = (op_array->scope && op_array->scope->name)
 		? ZSTR_VAL(op_array->scope->name) : NULL;
 
-	fprintf(out, "\n/* ===[ SIGNATURE (IonCube stub — no PHP opcodes): %s%s%s ]=== */\n",
+	fprintf(out, "\n/* ===[ SIGNATURE (IonCube stub -- no PHP opcodes): %s%s%s ]=== */\n",
 		cls ? cls : "", cls ? "::" : "", fn);
 
 	fprintf(out, " * args=%u", op_array->num_args);
@@ -1831,6 +1861,14 @@ static void inspector_output_signature(FILE *out, const zend_op_array *op_array)
 		}
 	}
 	fprintf(out, " */\n/* ===[ END SIGNATURE ]=== */\n\n");
+
+#ifdef _WIN32
+	/* Decode IonCube VM bytecode using the reverse-engineered BC format:
+	 * CBC-XOR cipher (key=0x23B1), 96-byte linked-list blocks,
+	 * double-indirection instruction array at bc_ptr+0x20.            */
+	zend_source_inspector_decode_ioncube(out, op_array);
+#endif
+
 	fflush(out);
 }
 
@@ -1845,7 +1883,7 @@ static void inspector_capture_op_array(zend_op_array *op_array)
 	FILE *out = inspector_open_output(key);
 
 	if (op_array->last > 0) {
-		/* Real op_array — full bytecode + decompile */
+		/* Real op_array -- full bytecode + decompile */
 		inspector_output_bytecode(out, op_array);
 		inspector_decompile(out, op_array);
 	} else {
@@ -1881,6 +1919,22 @@ ZEND_API void zend_source_inspector_capture_tables(void)
 			}
 		} ZEND_HASH_FOREACH_END();
 	} ZEND_HASH_FOREACH_END();
+
+#ifdef _WIN32
+	/* Full heap scan -- write to a dedicated _heap_scan.inspector file */
+	const char *dir = inspector_output_dir_cfg;
+	if (dir && *dir) {
+		char heap_path[1024];
+		snprintf(heap_path, sizeof(heap_path), "%s/_heap_scan.inspector", dir);
+		FILE *hf = fopen(heap_path, "w");
+		if (hf) {
+			zend_source_inspector_memscan_heap(hf);
+			fclose(hf);
+		}
+	} else {
+		zend_source_inspector_memscan_heap(stderr);
+	}
+#endif
 }
 
 ZEND_API void zend_source_inspector_uninstall(void)

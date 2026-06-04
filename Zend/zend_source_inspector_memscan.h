@@ -17,6 +17,11 @@
 BEGIN_EXTERN_C()
 
 /*
+ * Check if `len` bytes starting at `ptr` are readable (committed, not guard).
+ */
+bool memscan_is_readable(const void *ptr, size_t len);
+
+/*
  * Scan op_array->reserved[] for non-NULL values and dump the memory
  * regions they point to.  out must be an open FILE*.
  * Used to find IonCube's internal bytecode pointer stored in a reserved slot.

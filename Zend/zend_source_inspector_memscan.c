@@ -90,7 +90,7 @@ static void memscan_strings(FILE *out, const void *ptr, size_t len)
  * Probe one pointer: verify readable, dump region
  * ========================================================================= */
 
-static bool memscan_is_readable(const void *ptr, size_t len)
+bool memscan_is_readable(const void *ptr, size_t len)
 {
 	if (!ptr) return false;
 	uintptr_t addr = (uintptr_t)ptr;
@@ -234,6 +234,9 @@ void zend_source_inspector_memscan_op_array(
 
 					if (bc_ptr && bc_size > 0 && bc_size < 0x40000 &&
 					    memscan_is_readable(bc_ptr, 1)) {
+						/* Dump bc_ptr region — this is IonCube's already-decoded
+						 * runtime VM bytecode (contains DLL handler pointers).
+						 * The 'key' is NOT a simple XOR key; the data is live. */
 						size_t dump_bc = bc_size < DUMP_MAX ? bc_size : DUMP_MAX;
 						unsigned char *bc_buf = (unsigned char *)malloc(dump_bc);
 						if (bc_buf) {
@@ -242,22 +245,51 @@ void zend_source_inspector_memscan_op_array(
 								bc_ptr, bc_buf, dump_bc, &bc_read);
 							if (bc_read > 0) {
 								fprintf(out,
-									"/* ENCRYPTED BYTECODE (%zu bytes): */\n",
+									"/* VM BYTECODE (%zu bytes from bc_ptr): */\n",
 									bc_read);
 								memscan_hexdump(out, bc_buf, bc_read,
 									(uintptr_t)bc_ptr);
 
-								/* Attempt XOR with 8-byte key */
-								fprintf(out,
-									"\n/* XOR-DECRYPTED attempt"
-									" (key=%02x%02x%02x%02x%02x%02x%02x%02x): */\n",
-									enc_key[0],enc_key[1],enc_key[2],enc_key[3],
-									enc_key[4],enc_key[5],enc_key[6],enc_key[7]);
-								for (size_t x = 0; x < bc_read; x++)
-									bc_buf[x] ^= enc_key[x % 8];
-								memscan_hexdump(out, bc_buf, bc_read,
-									(uintptr_t)bc_ptr);
-								memscan_strings(out, bc_buf, bc_read);
+								/* Extract handler pointers (8-byte values in
+								 * the 0x0000000180000000+ range = IonCube DLL).
+								 * These are the opcode dispatch handlers. */
+								fprintf(out, "/* Handler pointers (IonCube DLL): */\n");
+								for (size_t x = 0; x + 8 <= bc_read; x += 8) {
+									uint64_t v = 0;
+									memcpy(&v, bc_buf + x, 8);
+									/* Check if it's in the DLL range:
+									 * 64-bit DLLs at preferred base 0x180000000 */
+									if (v >= 0x180000000ULL &&
+									    v < 0x200000000ULL) {
+										fprintf(out,
+											"  handler@+%04zx: 0x%016" PRIx64 "\n",
+											x, v);
+									}
+								}
+
+								/* Also dump the DLL code at the FIRST handler */
+								for (size_t x = 0; x + 8 <= bc_read; x += 8) {
+									uint64_t v = 0;
+									memcpy(&v, bc_buf + x, 8);
+									if (v >= 0x180000000ULL && v < 0x200000000ULL) {
+										void *h = (void *)(uintptr_t)v;
+										if (memscan_is_readable(h, 64)) {
+											unsigned char hbuf[64];
+											SIZE_T hread = 0;
+											ReadProcessMemory(GetCurrentProcess(),
+												h, hbuf, 64, &hread);
+											if (hread > 0) {
+												fprintf(out,
+													"\n/* DLL HANDLER 0x%" PRIx64
+													" (first 64 bytes = x64 code): */\n",
+													v);
+												memscan_hexdump(out, hbuf, hread,
+													(uintptr_t)h);
+											}
+										}
+										break; /* only first handler */
+									}
+								}
 							}
 							free(bc_buf);
 						}
